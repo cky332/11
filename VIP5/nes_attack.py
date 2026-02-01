@@ -62,11 +62,11 @@ class NESAttacker:
     - step_size: 更新步长，建议0.01-0.05
     """
     
-    def __init__(self, device='cuda', epsilon=0.05, max_iter=50,
-                 sigma=0.01, n_samples=20, step_size=0.01):
+    def __init__(self, device='cuda', epsilon=0.15, max_iter=100,
+                 sigma=0.02, n_samples=50, step_size=0.02, momentum=0.9):
         """
         初始化NES攻击器
-        
+
         Args:
             device: 计算设备 ('cuda' 或 'cpu')
             epsilon: 最大扰动幅度 (0-1)
@@ -74,6 +74,7 @@ class NESAttacker:
             sigma: 采样标准差
             n_samples: 每次迭代的采样数量
             step_size: 更新步长
+            momentum: 动量系数，用于稳定梯度估计
         """
         self.device = device if torch.cuda.is_available() else 'cpu'
         self.epsilon = epsilon
@@ -81,8 +82,9 @@ class NESAttacker:
         self.sigma = sigma
         self.n_samples = n_samples
         self.step_size = step_size
+        self.momentum = momentum
         self.target_features = None
-        
+
         # 加载CLIP模型（仅用于提取特征，不使用梯度）
         print(f"Loading CLIP model on {self.device}...")
         self.clip_model, self.clip_preprocess = clip.load('ViT-B/32', device=self.device)
@@ -134,82 +136,95 @@ class NESAttacker:
     
     def attack_single(self, image: Image.Image) -> Image.Image:
         """
-        对单张图像执行NES攻击
-        
+        对单张图像执行NES攻击（带动量和自适应步长）
+
         算法流程：
         1. 初始化扰动为零
         2. 循环max_iter次：
            a. 生成n_samples个随机噪声
            b. 对每个噪声，计算正向和负向扰动的得分
            c. 使用得分差异估计梯度
-           d. 沿梯度方向更新扰动
-           e. 将扰动投影到epsilon球内
+           d. 使用动量更新梯度方向
+           e. 沿梯度方向更新扰动
+           f. 将扰动投影到epsilon球内
         3. 返回扰动后的图像
-        
-        Args:
-            image: 原始PIL图像
-            
-        Returns:
-            attacked_image: 攻击后的PIL图像
         """
         # 转换为numpy数组 (224x224是CLIP的输入大小)
         img_array = np.array(image.resize((224, 224))).astype(np.float32) / 255.0
-        
+
         # 初始化扰动
         delta = np.zeros_like(img_array)
-        
+
+        # 动量缓冲
+        velocity = np.zeros_like(img_array)
+
         # 记录最佳结果
         best_delta = delta.copy()
         best_score = self.compute_score(image)
-        
+
+        # 自适应步长参数
+        step_size = self.step_size
+        no_improve_count = 0
+
         for iteration in range(self.max_iter):
             # 估计梯度
             grad_estimate = np.zeros_like(img_array)
-            
+
             # 使用antithetic sampling（对称采样）减少方差
             for _ in range(self.n_samples // 2):
                 # 生成随机噪声
                 noise = np.random.randn(*img_array.shape) * self.sigma
-                
+
                 # 正向扰动
                 delta_pos = np.clip(delta + noise, -self.epsilon, self.epsilon)
                 perturbed_pos = np.clip(img_array + delta_pos, 0, 1)
                 img_pos = Image.fromarray((perturbed_pos * 255).astype(np.uint8))
                 score_pos = self.compute_score(img_pos)
-                
+
                 # 负向扰动
                 delta_neg = np.clip(delta - noise, -self.epsilon, self.epsilon)
                 perturbed_neg = np.clip(img_array + delta_neg, 0, 1)
                 img_neg = Image.fromarray((perturbed_neg * 255).astype(np.uint8))
                 score_neg = self.compute_score(img_neg)
-                
+
                 # 梯度估计：使用得分差异加权噪声
                 grad_estimate += (score_pos - score_neg) * noise
-                
+
                 # 更新最佳结果
                 if score_pos > best_score:
                     best_score = score_pos
                     best_delta = delta_pos.copy()
+                    no_improve_count = 0
                 if score_neg > best_score:
                     best_score = score_neg
                     best_delta = delta_neg.copy()
-            
+                    no_improve_count = 0
+
             # 归一化梯度估计
             grad_estimate /= (self.n_samples * self.sigma)
-            
+
+            # 动量更新
+            velocity = self.momentum * velocity + (1 - self.momentum) * grad_estimate
+
             # 沿梯度方向更新扰动（梯度上升以最大化得分）
-            delta += self.step_size * np.sign(grad_estimate)
-            
+            delta += step_size * np.sign(velocity)
+
             # 投影到epsilon球内
             delta = np.clip(delta, -self.epsilon, self.epsilon)
-        
+
+            # 自适应步长：长时间无改善则增大sigma探索
+            no_improve_count += 1
+            if no_improve_count > 10:
+                step_size = min(step_size * 1.2, self.epsilon * 0.5)
+                no_improve_count = 0
+
         # 使用最佳扰动生成最终图像
         attacked_array = np.clip(img_array + best_delta, 0, 1)
         attacked_img = Image.fromarray((attacked_array * 255).astype(np.uint8))
-        
+
         # 恢复原始大小
         attacked_img = attacked_img.resize(image.size, Image.LANCZOS)
-        
+
         return attacked_img
     
     def attack_batch(self, image_dir: Path, output_dir: Path,
@@ -290,6 +305,137 @@ class NESAttacker:
         return results
 
 
+class FeatureSpaceAttacker:
+    """
+    特征空间直接攻击器
+
+    直接扰动CLIP特征向量（.npy文件），完全绕过像素空间→JPEG压缩→CLIP预处理的损失。
+    这是最有效的攻击方式，因为VIP5评估时直接加载.npy特征文件。
+
+    攻击策略：
+    1. 将特征向量向目标特征方向移动（定向攻击）
+    2. 控制扰动幅度以保持特征合理性
+    """
+
+    def __init__(self, epsilon=2.0, attack_type='targeted'):
+        """
+        Args:
+            epsilon: 特征空间中的最大扰动幅度（L2范数）
+            attack_type: 'targeted'（向目标移动）或 'untargeted'（随机扰动）
+        """
+        self.epsilon = epsilon
+        self.attack_type = attack_type
+        self.target_features = None
+
+    def set_target_features(self, features: np.ndarray):
+        """设置目标特征"""
+        self.target_features = features / (np.linalg.norm(features) + 1e-8)
+        print(f"Target features set (normalized), shape: {features.shape}")
+
+    def attack_feature(self, feature: np.ndarray) -> np.ndarray:
+        """
+        攻击单个特征向量
+
+        Args:
+            feature: 原始特征向量 (512,)
+        Returns:
+            attacked_feature: 攻击后的特征向量
+        """
+        feat_norm = np.linalg.norm(feature)
+
+        if self.attack_type == 'targeted' and self.target_features is not None:
+            # 定向攻击：将特征向目标方向移动
+            feat_normalized = feature / (feat_norm + 1e-8)
+            target_normalized = self.target_features
+
+            # 计算从当前特征到目标特征的方向
+            direction = target_normalized - feat_normalized
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm > 1e-8:
+                direction = direction / direction_norm
+
+            # 沿方向移动epsilon距离
+            perturbation = direction * self.epsilon
+
+            # 应用扰动并保持原始范数
+            attacked = feature + perturbation
+            attacked = attacked / (np.linalg.norm(attacked) + 1e-8) * feat_norm
+        else:
+            # 随机扰动
+            noise = np.random.randn(*feature.shape)
+            noise = noise / (np.linalg.norm(noise) + 1e-8) * self.epsilon
+            attacked = feature + noise
+            attacked = attacked / (np.linalg.norm(attacked) + 1e-8) * feat_norm
+
+        return attacked.astype(np.float32)
+
+    def attack_batch(self, original_feat_dir: Path, output_feat_dir: Path,
+                     num_features: Optional[int] = None) -> Dict:
+        """
+        批量攻击特征文件
+
+        Args:
+            original_feat_dir: 原始特征目录
+            output_feat_dir: 输出攻击特征目录
+            num_features: 攻击数量（None=全部）
+        """
+        output_feat_dir.mkdir(parents=True, exist_ok=True)
+
+        feat_files = list(original_feat_dir.glob('*.npy'))
+        if num_features and num_features < len(feat_files):
+            random.seed(42)
+            feat_files = random.sample(feat_files, num_features)
+
+        print(f"\n{'='*60}")
+        print(f"特征空间攻击 {len(feat_files)} 个特征")
+        print(f"{'='*60}")
+        print(f"Epsilon (L2): {self.epsilon}")
+        print(f"攻击类型: {self.attack_type}")
+        print(f"{'='*60}\n")
+
+        results = {'success': 0, 'failed': 0, 'details': []}
+
+        for feat_path in tqdm(feat_files, desc="Feature-space attacking"):
+            try:
+                original_feat = np.load(feat_path)
+                attacked_feat = self.attack_feature(original_feat)
+
+                # 保存攻击后的特征
+                np.save(output_feat_dir / feat_path.name, attacked_feat)
+
+                # 统计
+                cosine_sim = np.dot(original_feat, attacked_feat) / (
+                    np.linalg.norm(original_feat) * np.linalg.norm(attacked_feat) + 1e-8
+                )
+                l2_dist = np.linalg.norm(attacked_feat - original_feat)
+
+                if self.target_features is not None:
+                    target_sim_before = np.dot(original_feat, self.target_features) / (
+                        np.linalg.norm(original_feat) * np.linalg.norm(self.target_features) + 1e-8
+                    )
+                    target_sim_after = np.dot(attacked_feat, self.target_features) / (
+                        np.linalg.norm(attacked_feat) * np.linalg.norm(self.target_features) + 1e-8
+                    )
+                else:
+                    target_sim_before = 0
+                    target_sim_after = 0
+
+                results['success'] += 1
+                results['details'].append({
+                    'feature': feat_path.stem,
+                    'cosine_sim_orig_attacked': float(cosine_sim),
+                    'l2_distance': float(l2_dist),
+                    'target_sim_before': float(target_sim_before),
+                    'target_sim_after': float(target_sim_after),
+                    'target_sim_improvement': float(target_sim_after - target_sim_before),
+                })
+            except Exception as e:
+                print(f"\nError: {feat_path.name}: {e}")
+                results['failed'] += 1
+
+        return results
+
+
 def get_popular_items(split: str, top_k: int = 50) -> List[str]:
     """从sequential_data.txt获取热门商品列表"""
     data_dir = SCRIPT_DIR / 'data' / split
@@ -360,107 +506,152 @@ def main():
                         help='数据集名称 (默认: toys)')
     parser.add_argument('--num_images', type=int, default=None,
                         help='攻击图像数量 (默认: 全部)')
-    parser.add_argument('--epsilon', type=float, default=0.05,
-                        help='最大扰动幅度 (默认: 0.05)')
-    parser.add_argument('--max_iter', type=int, default=50,
-                        help='迭代次数 (默认: 50)')
-    parser.add_argument('--sigma', type=float, default=0.01,
-                        help='采样标准差 (默认: 0.01)')
-    parser.add_argument('--n_samples', type=int, default=20,
-                        help='每次迭代采样数 (默认: 20)')
-    parser.add_argument('--step_size', type=float, default=0.01,
-                        help='更新步长 (默认: 0.01)')
+    parser.add_argument('--epsilon', type=float, default=0.15,
+                        help='最大扰动幅度 (默认: 0.15)')
+    parser.add_argument('--max_iter', type=int, default=100,
+                        help='迭代次数 (默认: 100)')
+    parser.add_argument('--sigma', type=float, default=0.02,
+                        help='采样标准差 (默认: 0.02)')
+    parser.add_argument('--n_samples', type=int, default=50,
+                        help='每次迭代采样数 (默认: 50)')
+    parser.add_argument('--step_size', type=float, default=0.02,
+                        help='更新步长 (默认: 0.02)')
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help='动量系数 (默认: 0.9)')
+    parser.add_argument('--target_topk', type=int, default=5,
+                        help='使用top-k热门商品的特征作为目标 (默认: 5)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='计算设备 (默认: cuda)')
-    
+    parser.add_argument('--attack_mode', type=str, default='feature',
+                        choices=['pixel', 'feature', 'both'],
+                        help='攻击模式: pixel=像素空间NES, feature=特征空间直接攻击, both=两者都做 (默认: feature)')
+    parser.add_argument('--feat_epsilon', type=float, default=2.0,
+                        help='特征空间攻击的扰动幅度 (默认: 2.0)')
+
     args = parser.parse_args()
-    
+
     # 设置路径
     image_dir = SCRIPT_DIR / args.split
     output_dir = SCRIPT_DIR / f'{args.split}2'
     feature_dir = SCRIPT_DIR / 'features' / 'vitb32_features' / f'{args.split}_original'
-    
-    # 检查输入目录
-    if not image_dir.exists():
-        print(f"Error: Image directory not found: {image_dir}")
-        sys.exit(1)
-    
+    attacked_feature_dir = SCRIPT_DIR / 'features' / 'vitb32_features' / f'{args.split}_attacked'
+
     print("\n" + "="*60)
-    print("VIP5 黑盒对抗攻击 - NES Attack")
+    print("VIP5 黑盒对抗攻击")
     print("="*60)
-    print(f"输入目录: {image_dir}")
-    print(f"输出目录: {output_dir}")
-    print(f"Epsilon: {args.epsilon}")
-    print(f"迭代次数: {args.max_iter}")
-    print(f"采样数: {args.n_samples}")
-    
-    # 创建攻击器
-    attacker = NESAttacker(
-        device=args.device,
-        epsilon=args.epsilon,
-        max_iter=args.max_iter,
-        sigma=args.sigma,
-        n_samples=args.n_samples,
-        step_size=args.step_size
-    )
-    
+    print(f"攻击模式: {args.attack_mode}")
+
     # 加载目标特征
+    target_feat = None
     if feature_dir.exists():
         popular_items = get_popular_items(args.split)
         if popular_items:
-            target_feat = load_target_features(feature_dir, popular_items[:20])
-            if target_feat is not None:
-                attacker.set_target_features(target_feat)
-    else:
-        print(f"Warning: Feature directory not found: {feature_dir}")
-        print("Running without target features (using feature norm as score)")
-    
-    # 执行攻击
-    results = attacker.attack_batch(image_dir, output_dir, args.num_images)
-    
-    # 打印结果
-    print("\n" + "="*60)
-    print("攻击完成!")
-    print("="*60)
-    print(f"成功: {results['success']}")
-    print(f"失败: {results['failed']}")
-    
-    if results['details']:
-        feat_diffs = [d['feature_diff'] for d in results['details']]
-        cosine_sims = [d['cosine_sim'] for d in results['details']]
-        score_improvements = [d['score_improvement'] for d in results['details']]
-        
-        print(f"\n特征变化统计:")
-        print(f"  平均L2距离: {np.mean(feat_diffs):.4f}")
-        print(f"  平均余弦相似度: {np.mean(cosine_sims):.4f}")
-        
-        print(f"\n得分变化统计:")
-        print(f"  平均得分提升: {np.mean(score_improvements):+.4f}")
-        print(f"  得分提升比例: {sum(1 for s in score_improvements if s > 0) / len(score_improvements) * 100:.1f}%")
-    
-    # 保存结果
-    result_path = output_dir / 'attack_results.json'
-    with open(result_path, 'w') as f:
-        json.dump({
-            'method': 'nes',
-            'epsilon': args.epsilon,
-            'max_iter': args.max_iter,
-            'sigma': args.sigma,
-            'n_samples': args.n_samples,
-            'step_size': args.step_size,
-            'results': results
-        }, f, indent=2)
-    
-    print(f"\n结果已保存到: {result_path}")
-    
+            target_feat = load_target_features(feature_dir, popular_items[:args.target_topk])
+
+    # ===== 特征空间攻击 =====
+    if args.attack_mode in ('feature', 'both'):
+        print("\n" + "="*60)
+        print("阶段1: 特征空间直接攻击")
+        print("="*60)
+
+        if not feature_dir.exists():
+            print(f"Error: 原始特征目录不存在: {feature_dir}")
+            print("请先提取原始特征: python evaluate_attack.py --mode extract --split " + args.split)
+            sys.exit(1)
+
+        feat_attacker = FeatureSpaceAttacker(
+            epsilon=args.feat_epsilon,
+            attack_type='targeted' if target_feat is not None else 'untargeted'
+        )
+        if target_feat is not None:
+            feat_attacker.set_target_features(target_feat)
+
+        feat_results = feat_attacker.attack_batch(feature_dir, attacked_feature_dir, args.num_images)
+
+        print(f"\n特征空间攻击完成!")
+        print(f"成功: {feat_results['success']}, 失败: {feat_results['failed']}")
+        if feat_results['details']:
+            sim_improvements = [d['target_sim_improvement'] for d in feat_results['details']]
+            print(f"平均目标相似度提升: {np.mean(sim_improvements):+.4f}")
+            print(f"提升比例: {sum(1 for s in sim_improvements if s > 0) / len(sim_improvements) * 100:.1f}%")
+
+        # 保存结果
+        result_path = attacked_feature_dir / 'attack_results.json'
+        attacked_feature_dir.mkdir(parents=True, exist_ok=True)
+        with open(result_path, 'w') as f:
+            json.dump({
+                'method': 'feature_space',
+                'epsilon': args.feat_epsilon,
+                'results': feat_results
+            }, f, indent=2)
+
+        print(f"\n结果已保存到: {result_path}")
+
+    # ===== 像素空间NES攻击 =====
+    if args.attack_mode in ('pixel', 'both'):
+        print("\n" + "="*60)
+        print("阶段2: 像素空间NES攻击")
+        print("="*60)
+
+        if not image_dir.exists():
+            print(f"Error: Image directory not found: {image_dir}")
+            sys.exit(1)
+
+        print(f"输入目录: {image_dir}")
+        print(f"输出目录: {output_dir}")
+        print(f"Epsilon: {args.epsilon}")
+        print(f"迭代次数: {args.max_iter}")
+        print(f"采样数: {args.n_samples}")
+
+        attacker = NESAttacker(
+            device=args.device,
+            epsilon=args.epsilon,
+            max_iter=args.max_iter,
+            sigma=args.sigma,
+            n_samples=args.n_samples,
+            step_size=args.step_size,
+            momentum=args.momentum
+        )
+
+        if target_feat is not None:
+            attacker.set_target_features(target_feat)
+
+        results = attacker.attack_batch(image_dir, output_dir, args.num_images)
+
+        print(f"\n像素空间攻击完成!")
+        print(f"成功: {results['success']}, 失败: {results['failed']}")
+
+        if results['details']:
+            feat_diffs = [d['feature_diff'] for d in results['details']]
+            cosine_sims = [d['cosine_sim'] for d in results['details']]
+            score_improvements = [d['score_improvement'] for d in results['details']]
+
+            print(f"\n特征变化统计:")
+            print(f"  平均L2距离: {np.mean(feat_diffs):.4f}")
+            print(f"  平均余弦相似度: {np.mean(cosine_sims):.4f}")
+            print(f"  平均得分提升: {np.mean(score_improvements):+.4f}")
+
+        result_path = output_dir / 'attack_results.json'
+        with open(result_path, 'w') as f:
+            json.dump({
+                'method': 'nes_pixel',
+                'epsilon': args.epsilon,
+                'max_iter': args.max_iter,
+                'results': results
+            }, f, indent=2)
+
     # 打印下一步指令
     print("\n" + "="*60)
     print("下一步操作:")
     print("="*60)
-    print(f"1. 提取攻击后图片的CLIP特征:")
-    print(f"   python evaluate_attack.py --mode extract --split {args.split}")
-    print(f"\n2. 在VIP5模型上评估攻击效果:")
-    print(f"   python evaluate_attack_vip5.py --split {args.split} --num_samples 500")
+    if args.attack_mode == 'feature':
+        print(f"特征已直接攻击，无需再提取特征，直接评估:")
+        print(f"  python evaluate_attack_vip5.py --split {args.split} --num_samples 100")
+    else:
+        print(f"1. 提取攻击后图片的CLIP特征:")
+        print(f"   python evaluate_attack.py --mode extract --split {args.split}")
+        print(f"\n2. 在VIP5模型上评估攻击效果:")
+        print(f"   python evaluate_attack_vip5.py --split {args.split} --num_samples 100")
 
 
 if __name__ == '__main__':
